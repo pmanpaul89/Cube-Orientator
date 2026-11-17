@@ -1,11 +1,5 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="description" content="Rotates a picture, GIF or video so it shows upright on every face of the five-face LED cube.">
-<style>:root{color-scheme:light}html,body{margin:0}body{font-size:14px}img{max-width:100%}[hidden]{display:none!important}</style>
 <title>Cube Orient</title>
+<meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
 <style>
@@ -54,8 +48,6 @@ ol{margin:0;padding-left:20px;color:var(--mut);display:flex;flex-direction:colum
 @media (max-width:420px){h1{font-size:24px}}
 @media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
 </style>
-</head>
-<body>
 
 <main>
   <header>
@@ -243,19 +235,72 @@ async function decodeGif(buf){
   return out;
 }
 
+/* ---------- fallback: ffmpeg in the page, loaded only when the browser can't play a video ---------- */
+const VIDEO_EXT = /\.(3gp|3g2|mp4|m4v|mov|webm|avi|mkv|mpg|mpeg|wmv|flv)$/i;
+const FFMPEG_BASE = window.FFMPEG_BASE || "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/";
+const CORE_BASE = window.CORE_BASE || "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm/";
+let ffm = null;
+const loadScript = url => new Promise((res,rej) => { const s = document.createElement("script"); s.src = url; s.onload = res; s.onerror = () => rej(new Error("Couldn't download the video converter. Check your internet connection.")); document.head.appendChild(s); });
+const blobURL = async (url, type) => { const r = await fetch(url); if (!r.ok) throw new Error("Couldn't download the video converter."); return URL.createObjectURL(new Blob([await r.arrayBuffer()], {type})); };
+async function getFfmpeg(){
+  if (ffm) return ffm;
+  say("This browser can't play that video, so loading a converter (about 30 MB, first time only)…");
+  await loadScript(FFMPEG_BASE + "ffmpeg.js");
+  const f = new FFmpegWASM.FFmpeg();
+  await f.load({
+    classWorkerURL: await blobURL(FFMPEG_BASE + "814.ffmpeg.js", "text/javascript"),
+    coreURL: await blobURL(CORE_BASE + "ffmpeg-core.js", "text/javascript"),
+    wasmURL: await blobURL(CORE_BASE + "ffmpeg-core.wasm", "application/wasm"),
+  });
+  return (ffm = f);
+}
+async function ffmpegFrames(file){
+  const f = await getFfmpeg();
+  say("Converting the video…");
+  const n = VIDEO_SECONDS * VIDEO_FPS;
+  await f.writeFile("in.bin", new Uint8Array(await file.arrayBuffer()));
+  const code = await f.exec(["-i","in.bin","-t",String(VIDEO_SECONDS),"-an","-vf",
+    "fps=" + VIDEO_FPS + ",scale='min(" + SRC_SIDE + ",iw)':'min(" + SRC_SIDE + ",ih)':force_original_aspect_ratio=decrease",
+    "-frames:v",String(n),"f%04d.png"]);
+  const frames = [];
+  for (let i = 1; i <= n; i++){
+    let data; try{ data = await f.readFile("f" + String(i).padStart(4,"0") + ".png"); }catch(e){ break; }
+    const bmp = await createImageBitmap(new Blob([data], {type:"image/png"}));
+    const c = mk(bmp.width, bmp.height); c.getContext("2d").drawImage(bmp, 0, 0);
+    frames.push({canvas:c, delay:1000 / VIDEO_FPS});
+    try{ await f.deleteFile("f" + String(i).padStart(4,"0") + ".png"); }catch(e){}
+  }
+  try{ await f.deleteFile("in.bin"); }catch(e){}
+  if (!frames.length) throw new Error("That video couldn't be converted (exit code " + code + ").");
+  return frames;
+}
+
 async function openFile(file){
   if (busy || !file) return;
   token++; clearResult(); say("Reading the file…"); media = null; $("make").disabled = true;
   $("fileinfo").textContent = file.name + " · " + (file.size/1048576).toFixed(1) + " MB";
   try{
     const url = URL.createObjectURL(file);
-    if (file.type.startsWith("video/")){
-      const v = document.createElement("video");
-      v.muted = true; v.playsInline = true; v.preload = "auto"; v.src = url;
-      await new Promise((res,rej) => { v.onloadeddata = res; v.onerror = () => rej(new Error("This browser can't play that video.")); });
-      await seek(v, 0);
-      media = {kind:"video", name:file.name, video:v, preview: frameCanvas(v)};
-      $("fileinfo").textContent += " · video, " + v.duration.toFixed(1) + " s" + (v.duration > VIDEO_SECONDS ? " (first " + VIDEO_SECONDS + " s used)" : "");
+    if (file.type.startsWith("video/") || VIDEO_EXT.test(file.name)){
+      let v = null;
+      try{
+        v = document.createElement("video");
+        v.muted = true; v.playsInline = true; v.preload = "auto"; v.src = url;
+        await new Promise((res,rej) => {
+          const t = setTimeout(() => rej(new Error("timeout")), 8000);
+          v.onloadeddata = () => { clearTimeout(t); (v.videoWidth > 0) ? res() : rej(new Error("no picture")); };
+          v.onerror = () => { clearTimeout(t); rej(new Error("unsupported")); };
+        });
+        await seek(v, 0);
+        media = {kind:"video", name:file.name, video:v, preview: frameCanvas(v)};
+        $("fileinfo").textContent += " · video, " + v.duration.toFixed(1) + " s" + (v.duration > VIDEO_SECONDS ? " (first " + VIDEO_SECONDS + " s used)" : "");
+      }catch(err){
+        // This browser can't decode the format (old phone videos such as 3GP, for example):
+        // convert it with ffmpeg running inside the page instead.
+        const frames = await ffmpegFrames(file);
+        media = {kind:"gif", name:file.name, frames, preview: frames[0].canvas};
+        $("fileinfo").textContent += " · video converted, " + frames.length + " frames";
+      }
     } else if (file.type === "image/gif"){
       const frames = await decodeGif(await file.arrayBuffer());
       if (frames.length > 1) { media = {kind:"gif", name:file.name, frames, preview: frames[0].canvas}; $("fileinfo").textContent += " · animated GIF, " + frames.length + " frames"; }
@@ -367,6 +412,3 @@ refreshPreview();
 if (window.claude && window.claude.use) window.claude.use("downloads").then(d => { downloads = d; if (d && resultBlob) $("save").hidden = false; }).catch(() => {});
 })();
 </script>
-
-</body>
-</html>
