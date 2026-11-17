@@ -85,6 +85,8 @@ ol{margin:0;padding-left:20px;color:var(--mut);display:flex;flex-direction:colum
         <select id="top"><option value="blur">Blurred</option><option value="same">Same picture</option><option value="black">Black</option></select></label>
       <label for="start" id="startL">Left edge starts on face
         <select id="start"><option>2</option><option>3</option><option>4</option><option>5</option></select></label>
+      <label for="bars" id="barsL" hidden>Black bars in video
+        <select id="bars"><option value="cut">Remove them</option><option value="keep">Keep them</option></select></label>
     </div>
   </section>
 
@@ -205,11 +207,40 @@ function clearResult(){
   $("resultBox").hidden = true; $("save").hidden = true; $("saveHelp").hidden = true; $("resultMeta").textContent = "";
   const im = $("result"); if (im.src.startsWith("blob:")) URL.revokeObjectURL(im.src); im.removeAttribute("src");
 }
+/* black bars baked into a video (letterboxing): find the picture area and crop to it */
+function findBars(list){
+  let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1, W = 0, H = 0;
+  for (const c of list){
+    W = c.width; H = c.height;
+    const d = c.getContext("2d").getImageData(0,0,W,H).data;
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++){
+      const i = (y*W + x) * 4;
+      if (d[i] + d[i+1] + d[i+2] > 60){ if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+    }
+  }
+  if (x1 < 0) return null;
+  const w = x1 - x0 + 1, h = y1 - y0 + 1;
+  if (w >= W*0.94 && h >= H*0.94) return null;          // no real bars
+  return {x:x0, y:y0, w, h};
+}
+function cropped(src){
+  const r = media && media.crop;
+  if (!r || $("bars").value !== "cut") return src;
+  const k = src.width / (media.cropW || src.width);
+  const c = mk(Math.round(r.w*k), Math.round(r.h*k));
+  c.getContext("2d").drawImage(src, r.x*k, r.y*k, r.w*k, r.h*k, 0, 0, c.width, c.height);
+  return c;
+}
+function setCrop(list){
+  if (!list.length) return;
+  media.cropW = list[0].width; media.crop = findBars(list);
+}
 function refreshPreview(){
   const o = opts();
+  $("barsL").hidden = !(media && media.crop);
   $("topL").hidden = $("startL").hidden = o.mode !== "wrap";
   if (!media) { drawNet(buildTiles(emptySrc(), o)); return; }
-  drawNet(buildTiles(media.preview, o));
+  drawNet(buildTiles(cropped(media.preview), o));
 }
 function emptySrc(){ const c = mk(256,256), x = c.getContext("2d"); x.fillStyle="#2a2a2a"; x.fillRect(0,0,256,256); return c; }
 
@@ -297,12 +328,16 @@ async function openFile(file){
         });
         await seek(v, 0);
         media = {kind:"video", name:file.name, video:v, preview: frameCanvas(v)};
+        const smp = [];
+        for (const f of [0.1,0.3,0.5,0.7,0.9]){ await seek(v, v.duration*f); smp.push(frameCanvas(v)); }
+        await seek(v, 0); setCrop(smp);
         $("fileinfo").textContent += " · video, " + v.duration.toFixed(1) + " s" + (v.duration > VIDEO_SECONDS ? " (first " + VIDEO_SECONDS + " s used)" : "");
       }catch(err){
         // This browser can't decode the format (old phone videos such as 3GP, for example):
         // convert it with ffmpeg running inside the page instead.
         const frames = await ffmpegFrames(file);
         media = {kind:"gif", name:file.name, frames, preview: frames[0].canvas};
+        setCrop(frames.filter((_,i) => i % Math.max(1, Math.floor(frames.length/8)) === 0).map(f => f.canvas));
         $("fileinfo").textContent += " · video converted, " + frames.length + " frames";
       }
     } else if (file.type === "image/gif"){
@@ -334,7 +369,7 @@ function seek(v, t){
 async function make(){
   if (!media || busy) return;
   busy = true; const my = ++token; const o = opts();
-  $("make").disabled = true; ["mode","fit","top","start","pick"].forEach(i => $(i).disabled = true);
+  $("make").disabled = true; ["mode","fit","top","start","bars","pick"].forEach(i => $(i).disabled = true);
   clearResult(); $("prog").hidden = false; $("prog").value = 0;
   try{
     let blob, ext;
@@ -356,7 +391,7 @@ async function make(){
         if (my !== token) return;
         let src = list[i].canvas;
         if (!src){ await seek(media.video, list[i].t); src = frameCanvas(media.video); }
-        const c = compose(buildTiles(src, o));
+        const c = compose(buildTiles(cropped(src), o));
         const data = c.getContext("2d").getImageData(0,0,c.width,c.height).data;
         const pal = L.quantize(data, 256), idx = L.applyPalette(data, pal);
         gif.writeFrame(idx, c.width, c.height, {palette:pal, delay:Math.round(list[i].delay), repeat:0});
@@ -376,7 +411,7 @@ async function make(){
   }catch(e){ say("Something went wrong: " + (e.message || e), "bad"); }
   finally{
     busy = false; $("prog").hidden = true; $("make").disabled = !media;
-    ["mode","fit","top","start","pick"].forEach(i => $(i).disabled = false);
+    ["mode","fit","top","start","bars","pick"].forEach(i => $(i).disabled = false);
   }
 }
 
@@ -404,7 +439,7 @@ async function save(){
 /* ---------- wiring ---------- */
 $("pick").onclick = () => $("file").click();
 $("file").onchange = e => { openFile(e.target.files[0]); e.target.value = ""; };
-["mode","fit","top","start"].forEach(i => $(i).onchange = () => { token++; clearResult(); refreshPreview(); if (media) say("Options changed. Make the file again."); });
+["mode","fit","top","start","bars"].forEach(i => $(i).onchange = () => { token++; clearResult(); refreshPreview(); if (media) say("Options changed. Make the file again."); });
 $("make").onclick = make;
 $("save").onclick = save;
 const drop = $("drop");
